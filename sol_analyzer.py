@@ -1,19 +1,16 @@
 import ccxt
 import pandas as pd
 import numpy as np
-import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # ====================== 配置 ======================
 SYMBOL = 'SOL/USDT:USDT'
-TIMEFRAME_SHORT = '30m'
-TIMEFRAME_MID = '1h'
-LIMIT = 200
+LIMIT = 1000
 
 okx = ccxt.okx({'enableRateLimit': True})
 
-# ====================== 时间函数（已修复） ======================
+# ====================== 时间函数 ======================
 def get_beijing_time():
     utc_now = datetime.now(ZoneInfo("UTC"))
     beijing_now = utc_now.astimezone(ZoneInfo("Asia/Shanghai"))
@@ -38,7 +35,6 @@ def calculate_supertrend(df, atr_period=10, multiplier=2.0):
     atr = calculate_atr(df, atr_period)
     upper = hl2 + multiplier * atr
     lower = hl2 - multiplier * atr
-    
     supertrend = pd.Series(index=df.index, dtype=float)
     direction = pd.Series(index=df.index, dtype=int)
     
@@ -57,49 +53,72 @@ def calculate_supertrend(df, atr_period=10, multiplier=2.0):
     df['ATR'] = calculate_atr(df, 12)
     return df
 
+# ====================== 7天偏离值分位数 ======================
+def calculate_deviation_percentile(df):
+    df = df.copy()
+    df['MA200'] = df['close'].rolling(200).mean()
+    df['ATR'] = calculate_atr(df, 12)
+    df['Deviation'] = (df['close'] - df['MA200']) / df['ATR']
+    recent = df['Deviation'].dropna().tail(800)          # 确保覆盖至少7天
+    if len(recent) < 200:
+        return 50.0
+    current_dev = df['Deviation'].iloc[-1]
+    percentile = (recent < current_dev).mean() * 100
+    return round(percentile, 2)
+
 # ====================== 数据获取 ======================
-def fetch_ohlcv(timeframe, limit=200):
+def fetch_ohlcv(timeframe, limit=1000):
     ohlcv = okx.fetch_ohlcv(SYMBOL, timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
 
-def get_derivative_data():
-    try:
-        headers = {'Content-Type': 'application/json'}
-        fr = requests.get("https://api.coinglass.com/api/fundingRate?symbol=SOL", headers=headers, timeout=10).json()
-        funding_rate = float(fr.get('data', [{}])[0].get('rate', 0))
-        return {"funding_rate": round(funding_rate, 4)}
-    except:
-        return {"funding_rate": 0.0}
-
-# ====================== 信号生成 ======================
+# ====================== 均值回归信号生成（核心） ======================
 def generate_signal(df, period_name="短期"):
+    df = calculate_ma(df)
+    df = calculate_supertrend(df)
+    percentile = calculate_deviation_percentile(df)
     latest = df.iloc[-1]
-    ma_trend = latest['MA_50'] > latest['MA_200']
-    st_dir = latest['ST_Direction']
-    atr = latest['ATR']
     price = latest['close']
+    atr = latest['ATR']
+    ma200 = latest['MA_200']
+    st_dir = latest['ST_Direction']
+    ma_trend_up = latest['MA_50'] > latest['MA_200']
     
-    if st_dir == 1 and ma_trend and price > latest['MA_50']:
+    # 根据不同时间框架设置不同阈值
+    if period_name == "短期":        # 15m 更激进
+        high_p, low_p = 85, 15
+        risk_percent = 1.5
+    else:                            # 1h 更稳健
+        high_p, low_p = 80, 20
+        risk_percent = 1.0
+
+    # 均值回归逻辑
+    if percentile <= low_p and price < ma200 and st_dir == -1:           # 严重低估 + 处于空头趋势中
         direction = "做多"
         operation = "买入开多"
-        entry = round(price * 1.0005, 4)
-        stop_loss = round(entry - atr * 2.2, 4)
-        tp1 = round(entry + atr * 3.5, 4)
-        tp2 = round(entry + atr * 6.5, 4)
-    elif st_dir == -1 and not ma_trend and price < latest['MA_50']:
+        strength = "强信号"
+    elif percentile >= high_p and price > ma200 and st_dir == 1:         # 严重高估 + 处于多头趋势中
         direction = "做空"
         operation = "卖出开空"
-        entry = round(price * 0.9995, 4)
-        stop_loss = round(entry + atr * 2.2, 4)
-        tp1 = round(entry - atr * 3.5, 4)
-        tp2 = round(entry - atr * 6.5, 4)
+        strength = "强信号"
+    elif percentile <= 25 or percentile >= 75:
+        direction = "观望"
+        operation = "观望"
+        strength = "中等偏离，需等待更极端分位数"
     else:
         direction = "观望"
         operation = "观望"
+        strength = "分位数处于正常区间"
+
+    if direction != "观望":
+        entry = round(price * (1.0008 if direction == "做多" else 0.9992), 4)
+        stop_loss = round(entry - atr * 2.0 if direction == "做多" else entry + atr * 2.0, 4)
+        tp1 = round(entry + atr * 4.5 if direction == "做多" else entry - atr * 4.5, 4)
+        tp2 = round(entry + atr * 8.0 if direction == "做多" else entry - atr * 8.0, 4)
+    else:
         entry = stop_loss = tp1 = tp2 = "-"
-    
+
     return {
         "direction": direction,
         "operation": operation,
@@ -107,8 +126,12 @@ def generate_signal(df, period_name="短期"):
         "stop_loss": stop_loss,
         "tp1": tp1,
         "tp2": tp2,
+        "percentile": percentile,
         "atr": round(atr, 4),
-        "funding_rate": get_derivative_data()["funding_rate"]
+        "strength": strength,
+        "ma_trend": "多头排列" if ma_trend_up else "空头排列",
+        "st_dir": "多头" if st_dir == 1 else "空头",
+        "risk_percent": risk_percent
     }
 
 # ====================== 主函数 ======================
@@ -116,25 +139,18 @@ def main():
     beijing_time = get_beijing_time()
     print(f"开始运行分析 - 北京时间: {beijing_time}")
     
-    df_short = fetch_ohlcv(TIMEFRAME_SHORT)
-    df_mid = fetch_ohlcv(TIMEFRAME_MID)
+    df_short = fetch_ohlcv('15m', LIMIT)
+    df_mid = fetch_ohlcv('1h', LIMIT)
     
-    df_short = calculate_ma(df_short)
-    df_short = calculate_supertrend(df_short)
-    
-    df_mid = calculate_ma(df_mid)
-    df_mid = calculate_supertrend(df_mid)
-    
-    deriv = get_derivative_data()
     short_signal = generate_signal(df_short, "短期")
     mid_signal = generate_signal(df_mid, "中期")
     
-    readme_content = f"""# SOL 永续合约量化分析报告
+    readme_content = f"""# SOL 永续合约均值回归分析报告
 
 **最后更新**：{beijing_time}（北京时间）
 
-**数据来源**：OKX K线 + Coinglass 衍生数据  
-**技术指标**：MA(10,50,100,200)、ATR(12)、SuperTrend(10,2.0)
+**策略类型**：均值回归策略  
+**使用指标**：MA(10,50,100,200)、ATR(12)、SuperTrend(10,2.0) + 最近7天偏离值分位数
 
 ---
 
@@ -146,7 +162,7 @@ def main():
 - 挂单价格：{short_signal['entry']}
 - 止损价格：{short_signal['stop_loss']}
 - 止盈价格：TP1 {short_signal['tp1']} | TP2 {short_signal['tp2']}
-- 建议仓位比例：1.2%
+- 建议仓位比例：{short_signal['risk_percent']}%
 
 **【中期交易计划】（4-12小时）**
 - 方向：**{mid_signal['direction']}**
@@ -154,32 +170,35 @@ def main():
 - 挂单价格：{mid_signal['entry']}
 - 止损价格：{mid_signal['stop_loss']}
 - 止盈价格：TP1 {mid_signal['tp1']} | TP2 {mid_signal['tp2']}
-- 建议仓位比例：0.8%
+- 建议仓位比例：{mid_signal['risk_percent']}%
 
 ---
 
 ### 二、交易逻辑与策略分析
 
-**短期逻辑**：
-- SuperTrend 方向：{"多头" if short_signal['direction']=='做多' else '空头' if short_signal['direction']=='做空' else '中性'}
-- MA趋势：MA50 > MA200 = {"多头排列" if df_short['MA_50'].iloc[-1] > df_short['MA_200'].iloc[-1] else "空头排列"}
-- 当前ATR(12) = {short_signal['atr']}，止损距离约 2.2×ATR
-- 资金费率：{deriv['funding_rate']}%（{"正费率" if deriv['funding_rate'] > 0 else "负费率"}）
+**偏离值分位数统计**（基于最近7天数据）：
+- 短期（15分钟图）：当前价格偏离MA200的程度处于过去7天 **{short_signal['percentile']}% 分位**
+- 中期（1小时图）：当前价格偏离MA200的程度处于过去7天 **{mid_signal['percentile']}% 分位**
 
-**中期逻辑**：基于1小时图判断，侧重趋势持续性，与短期逻辑一致但更注重大结构。
+**短期逻辑（15分钟图）**：
+当前处于{short_signal['ma_trend']}，SuperTrend为{short_signal['st_dir']}。价格偏离MA200达到{short_signal['percentile']}%分位，属于{ "极端低估区域" if short_signal['percentile'] <= 25 else "极端高估区域" if short_signal['percentile'] >= 75 else "正常波动区间"}。结合SuperTrend过滤后，判断为{short_signal['strength']}。本策略核心是在价格严重偏离均值时进行反向回归交易，同时要求SuperTrend方向与大趋势环境配合。
 
-**核心策略**：仅当 SuperTrend 与 MA50/200 趋势共振时开仓，否则保持观望。止盈止损严格按ATR比例执行。
+**中期逻辑（1小时图）**：
+当前处于{mid_signal['ma_trend']}，SuperTrend为{mid_signal['st_dir']}。价格偏离MA200达到{mid_signal['percentile']}%分位，属于{ "极端低估区域" if mid_signal['percentile'] <= 25 else "极端高估区域" if mid_signal['percentile'] >= 75 else "正常波动区间"}。中期判断更为谨慎，需更极端的偏离度才会触发信号。
 
-**风险提示**：本报告由固定量化规则自动生成，仅供学习和研究参考，不构成任何投资建议。交易有风险，请严格控制仓位。
+**整体策略思路**：
+本系统以MA200为均值基准，通过ATR标准化后的偏离值在过去7天的分位数作为主要决策依据。只有当分位数进入极端区域（低估<20或高估>80），同时SuperTrend趋势过滤条件满足时才开仓。止损设置在1.8~2.0倍ATR，止盈设置为4.5倍和8倍ATR，符合均值回归“快止损、让利润回归均值”的特点。非极端分位数一律观望，避免无效交易。
+
+**风险提示**：本报告由量化规则自动生成，仅供学习和研究使用，不构成任何投资建议。交易有风险，请严格控制仓位和风险。
 
 ---
-*由 GitHub Actions 每 30 分钟自动运行并更新*
+*由 GitHub Actions 每30分钟自动运行并更新此文件*
 """
 
     with open("README.md", "w", encoding="utf-8") as f:
         f.write(readme_content)
     
-    print("✅ 分析完成，README.md 已更新")
+    print("✅ 均值回归策略分析完成，README.md 已更新")
 
 if __name__ == "__main__":
     main()
