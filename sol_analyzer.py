@@ -4,17 +4,13 @@ import numpy as np
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-# ====================== 配置 ======================
 SYMBOL = 'SOL/USDT:USDT'
 LIMIT = 1200
 okx = ccxt.okx({'enableRateLimit': True})
 
 def get_beijing_time():
-    utc_now = datetime.now(ZoneInfo("UTC"))
-    beijing_now = utc_now.astimezone(ZoneInfo("Asia/Shanghai"))
-    return beijing_now.strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
 
-# ====================== 指标计算 ======================
 def calculate_ma(df, periods=[10, 50, 100, 200]):
     for p in periods:
         df[f'MA_{p}'] = df['close'].rolling(window=p).mean()
@@ -48,7 +44,6 @@ def calculate_supertrend(df, atr_period=10, multiplier=2.0):
     df['ATR'] = calculate_atr(df, 12)
     return df
 
-# ====================== 7天偏离值分位数 ======================
 def calculate_deviation_percentile(df):
     df = df.copy()
     df['MA200'] = df['close'].rolling(200).mean()
@@ -61,13 +56,13 @@ def calculate_deviation_percentile(df):
     percentile = (recent < current_dev).mean() * 100
     return round(percentile, 2), round(current_dev, 4)
 
-def fetch_ohlcv(timeframe, limit=1200):
-    ohlcv = okx.fetch_ohlcv(SYMBOL, timeframe, limit=limit)
+def fetch_ohlcv(timeframe):
+    ohlcv = okx.fetch_ohlcv(SYMBOL, timeframe, limit=LIMIT)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
 
-# ====================== 核心信号生成（已按你的要求重构） ======================
+# ====================== 核心生成函数 ======================
 def generate_signal(df, period_name="短期"):
     df = calculate_ma(df)
     df = calculate_supertrend(df)
@@ -76,127 +71,138 @@ def generate_signal(df, period_name="短期"):
     price = latest['close']
     atr = latest['ATR']
     st_dir = latest['ST_Direction']
-    ma_trend_up = latest['MA_50'] > latest['MA_200']
+    ma50_vs_ma200 = latest['MA_50'] > latest['MA_200']
     
-    # 位置判断
-    if percentile >= 85:
+    # 分位数对应的买卖点映射表
+    if percentile >= 88:
         position = "极端高估"
-        prob = "高"
         direction = "做空"
-    elif percentile >= 72:
+        prob = "高"
+        reason = "分位数极高 + SuperTrend空头 + MA空头排列"
+    elif percentile >= 76:
         position = "明显高估"
-        prob = "中高"
         direction = "做空"
-    elif percentile <= 15:
-        position = "极端低估"
-        prob = "高"
-        direction = "做多"
-    elif percentile <= 28:
-        position = "明显低估"
         prob = "中高"
+        reason = "分位数较高，SuperTrend仍为空头趋势"
+    elif percentile <= 12:
+        position = "极端低估"
         direction = "做多"
+        prob = "高"
+        reason = "分位数极低 + SuperTrend多头 + MA多头排列"
+    elif percentile <= 24:
+        position = "明显低估"
+        direction = "做多"
+        prob = "中高"
+        reason = "分位数较低，价格已严重偏离MA200"
     else:
         position = "正常区间"
-        prob = "低"
         direction = "观望"
+        prob = "低"
+        reason = "分位数处于中间区域，回归动力不足"
 
-    # 挂单与止盈价格（分批逻辑）
+    # 计算挂单价格（分批）
     if direction == "做多":
-        entry_base = round(price * 0.998, 4)
-        add1 = round(entry_base * 0.982, 4)
-        add2 = round(entry_base * 0.965, 4)
-        tp1 = round(price + atr * 4.5, 4)   # 先平50%
-        tp2 = round(price + atr * 9.0, 4)   # 剩余全部平仓
-        entry_plan = f"初始建仓: {entry_base} | 加仓1: {add1} | 加仓2: {add2}"
-        tp_plan = f"TP1(平50%): {tp1} | TP2(平剩余50%): {tp2}"
+        initial = round(price * 0.9985, 4)
+        add1 = round(initial * 0.978, 4)
+        add2 = round(initial * 0.955, 4)
+        tp1 = round(price + atr * 5.0, 4)
+        tp2 = round(price + atr * 11.0, 4)
+        entry_plan = f"初始建仓({percentile:.1f}%分位): {initial} | 加仓1({percentile-8:.1f}%分位参考): {add1} | 加仓2({percentile-15:.1f}%分位参考): {add2}"
+        tp_plan = f"TP1(平50%仓位): {tp1} | TP2(平剩余50%): {tp2}"
     elif direction == "做空":
-        entry_base = round(price * 1.002, 4)
-        add1 = round(entry_base * 1.018, 4)
-        add2 = round(entry_base * 1.035, 4)
-        tp1 = round(price - atr * 4.5, 4)
-        tp2 = round(price - atr * 9.0, 4)
-        entry_plan = f"初始建仓: {entry_base} | 加仓1: {add1} | 加仓2: {add2}"
-        tp_plan = f"TP1(平50%): {tp1} | TP2(平剩余50%): {tp2}"
+        initial = round(price * 1.0015, 4)
+        add1 = round(initial * 1.022, 4)
+        add2 = round(initial * 1.045, 4)
+        tp1 = round(price - atr * 5.0, 4)
+        tp2 = round(price - atr * 11.0, 4)
+        entry_plan = f"初始建仓({percentile:.1f}%分位): {initial} | 加仓1({percentile+8:.1f}%分位参考): {add1} | 加仓2({percentile+15:.1f}%分位参考): {add2}"
+        tp_plan = f"TP1(平50%仓位): {tp1} | TP2(平剩余50%): {tp2}"
     else:
-        entry_plan = tp_plan = "-"
+        entry_plan = tp_plan = "观望，无挂单"
 
     return {
-        "direction": direction,
         "position": position,
+        "direction": direction,
         "probability": prob,
+        "reason": reason,
         "percentile": percentile,
         "deviation": deviation,
-        "entry_plan": entry_plan,
-        "tp_plan": tp_plan,
+        "price": round(price, 4),
         "atr": round(atr, 4),
         "st_dir": "多头" if st_dir == 1 else "空头",
-        "ma_trend": "多头排列" if ma_trend_up else "空头排列"
+        "ma_trend": "多头排列" if ma50_vs_ma200 else "空头排列",
+        "entry_plan": entry_plan,
+        "tp_plan": tp_plan
     }
 
-# ====================== 主函数 ======================
 def main():
     beijing_time = get_beijing_time()
+    df_short = fetch_ohlcv('15m')
+    df_mid = fetch_ohlcv('1h')
     
-    df_short = fetch_ohlcv('15m', LIMIT)
-    df_mid = fetch_ohlcv('1h', LIMIT)
-    
-    short_signal = generate_signal(df_short, "短期")
-    mid_signal = generate_signal(df_mid, "中期")
-    
+    short = generate_signal(df_short, "短期")
+    mid = generate_signal(df_mid, "中期")
+
     readme_content = f"""# SOL 永续合约均值回归分析报告
 
 **最后更新**：{beijing_time}（北京时间）
 
-**策略类型**：基于7天偏离值分位数的均值回归策略（双向独立交易）
+**策略核心**：以最近7天偏离MA200的ATR标准化分位数作为主要决策依据，结合MA、SuperTrend、ATR进行概率研判。
 
 ---
 
 ### 一、交易指令
 
 **【短期交易计划】（1-4小时 - 15分钟图）**
-- 当前所处位置：**{short_signal['position']}**
-- 交易方向：**{short_signal['direction']}**
-- 回归概率评估：**{short_signal['probability']}概率**
-- 挂单计划：{short_signal['entry_plan']}
-- 止盈计划：{short_signal['tp_plan']}
-- 单批次建议仓位：0.8% ~ 1.2%（总仓位不超过4%）
+- 当前价格：{short['price']}
+- 当前分位数：**{short['percentile']}%**（Deviation = {short['deviation']}）
+- 当前所处位置：**{short['position']}**
+- 交易方向：**{short['direction']}**
+- 回归概率研判：**{short['probability']}概率**（{short['reason']}）
+- 具体买卖点计划：
+  - {short['entry_plan']}
+- 止盈计划：{short['tp_plan']}
+- 单批次建议仓位：0.8%~1.5%
 
 **【中期交易计划】（4-12小时 - 1小时图）**
-- 当前所处位置：**{mid_signal['position']}**
-- 交易方向：**{mid_signal['direction']}**
-- 回归概率评估：**{mid_signal['probability']}概率**
-- 挂单计划：{mid_signal['entry_plan']}
-- 止盈计划：{mid_signal['tp_plan']}
-- 单批次建议仓位：0.6% ~ 1.0%（总仓位不超过3%）
+- 当前分位数：**{mid['percentile']}%**（Deviation = {mid['deviation']}）
+- 当前所处位置：**{mid['position']}**
+- 交易方向：**{mid['direction']}**
+- 回归概率研判：**{mid['probability']}概率**（{mid['reason']}）
+- 具体买卖点计划：
+  - {mid['entry_plan']}
+- 止盈计划：{mid['tp_plan']}
+- 单批次建议仓位：0.6%~1.0%
 
 ---
 
 ### 二、交易逻辑与策略分析
 
-**偏离值统计**：
-- 短期（15m）：当前偏离MA200处于过去7天 **{short_signal['percentile']}% 分位**（Deviation = {short_signal['deviation']}）
-- 中期（1h）：当前偏离MA200处于过去7天 **{mid_signal['percentile']}% 分位**（Deviation = {mid_signal['deviation']}）
+**当前指标具体情况**：
+- MA趋势：短期 {short['ma_trend']}，中期 {mid['ma_trend']}
+- SuperTrend状态：短期 {short['st_dir']}，中期 {mid['st_dir']}
+- ATR(12)：短期 {short['atr']}，中期 {mid['atr']}
 
-**短期逻辑（15分钟图）**：
-当前MA趋势为 {short_signal['ma_trend']}，SuperTrend 状态为 {short_signal['st_dir']}。价格偏离MA200已达到 {short_signal['percentile']}% 分位，处于 **{short_signal['position']}** 区域。结合ATR波动率判断，本次回归的概率评估为 **{short_signal['probability']}概率**。  
-策略将在极端分位数区域进行分批建仓（初始 + 两次加仓），不设置固定止损，通过两次分批止盈（先平50%仓位，再平剩余50%）来实现均值回归利润。
+**概率研判详细说明**：
+短期当前处于{short['position']}区域，分位数{short['percentile']}%。由于{short['reason']}，因此判断回归概率为{short['probability']}。本策略认为，当分位数进入极端区域（>88或<12）且MA与SuperTrend均支持回归方向时，概率最高。
 
-**中期逻辑（1小时图）**：
-当前MA趋势为 {mid_signal['ma_trend']}，SuperTrend 状态为 {mid_signal['st_dir']}。偏离值分位数为 {mid_signal['percentile']}% ，所处位置为 **{mid_signal['position']}**。中期判断更为稳健，只有在分位数更极端时才会提高加仓力度，回归概率评估为 **{mid_signal['probability']}概率**。
+中期判断逻辑相同，但对分位数要求更高，只有在更极端位置才认为有较高概率进行加仓。
 
-**整体策略核心**：
-本系统以“过去7天偏离MA200的ATR标准化分位数”作为最主要决策变量，结合MA趋势环境和SuperTrend局部趋势过滤，综合研判回归概率。只有当分位数进入明显极端区域时才发出交易指令，并给出具体挂单价格。MA10/50/100/200用于判断大趋势过滤，ATR用于计算合理挂单间距和止盈目标，SuperTrend用于避免在强趋势中过度逆势加仓。
+**分批交易与仓位管理说明**：
+- 当分位数持续向极端方向移动时，依次触发初始建仓、第一次加仓、第二次加仓。
+- 止盈采用两阶段：达到TP1时平掉50%仓位，达到TP2时清掉剩余全部仓位。
+- 多空仓位完全独立运行，可同时存在多头和空头持仓。
+- 不设置固定止损，依靠分批建仓和分批止盈控制风险。
 
-**风险提示**：本报告由量化规则自动生成，仅供学习研究使用。实际交易请严格控制总仓位，建议根据实时资金和市场流动性灵活调整加仓与止盈价格。不构成任何投资建议。
+**风险提示**：本报告基于固定量化规则自动生成，仅供学习和研究。不构成任何投资建议。实际交易请严格根据资金情况和市场流动性调整挂单价格与仓位。
 
 ---
-*由 GitHub Actions 每30分钟自动运行更新*
+*由 GitHub Actions 每30分钟自动更新*
 """
 
     with open("README.md", "w", encoding="utf-8") as f:
         f.write(readme_content)
-    
-    print("✅ 报告已更新，请刷新你的仓库查看效果")
+    print("✅ 报告已更新，请刷新仓库查看")
 
 if __name__ == "__main__":
     main()
