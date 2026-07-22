@@ -2,8 +2,8 @@ import ccxt
 import pandas as pd
 import numpy as np
 import requests
-import os
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # ====================== 配置 ======================
 SYMBOL = 'SOL/USDT:USDT'
@@ -12,6 +12,12 @@ TIMEFRAME_MID = '1h'
 LIMIT = 200
 
 okx = ccxt.okx({'enableRateLimit': True})
+
+# ====================== 时间函数（已修复） ======================
+def get_beijing_time():
+    utc_now = datetime.now(ZoneInfo("UTC"))
+    beijing_now = utc_now.astimezone(ZoneInfo("Asia/Shanghai"))
+    return beijing_now.strftime("%Y-%m-%d %H:%M:%S")
 
 # ====================== 指标计算 ======================
 def calculate_ma(df, periods=[10, 50, 100, 200]):
@@ -44,7 +50,6 @@ def calculate_supertrend(df, atr_period=10, multiplier=2.0):
             supertrend.iloc[i] = max(lower.iloc[i], supertrend.iloc[i-1])
         else:
             supertrend.iloc[i] = min(upper.iloc[i], supertrend.iloc[i-1])
-        
         direction.iloc[i] = 1 if df['close'].iloc[i] > supertrend.iloc[i] else -1
     
     df['SuperTrend'] = supertrend
@@ -62,19 +67,11 @@ def fetch_ohlcv(timeframe, limit=200):
 def get_derivative_data():
     try:
         headers = {'Content-Type': 'application/json'}
-        # 资金费率
         fr = requests.get("https://api.coinglass.com/api/fundingRate?symbol=SOL", headers=headers, timeout=10).json()
         funding_rate = float(fr.get('data', [{}])[0].get('rate', 0))
-        # 持仓量
-        oi = requests.get("https://api.coinglass.com/api/openInterest?symbol=SOL", headers=headers, timeout=10).json()
-        open_interest = oi.get('data', [{}])[0].get('openInterest', 0)
-        return {
-            "funding_rate": round(funding_rate, 4),
-            "open_interest": open_interest,
-            "long_short_ratio": 1.15  # 简化值，后续可继续完善API
-        }
-    except Exception as e:
-        return {"funding_rate": 0.0, "open_interest": 0, "long_short_ratio": 1.0}
+        return {"funding_rate": round(funding_rate, 4)}
+    except:
+        return {"funding_rate": 0.0}
 
 # ====================== 信号生成 ======================
 def generate_signal(df, period_name="短期"):
@@ -116,8 +113,8 @@ def generate_signal(df, period_name="短期"):
 
 # ====================== 主函数 ======================
 def main():
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S (北京时间)")
-    print(f"开始运行分析 - {current_time}")
+    beijing_time = get_beijing_time()
+    print(f"开始运行分析 - 北京时间: {beijing_time}")
     
     df_short = fetch_ohlcv(TIMEFRAME_SHORT)
     df_mid = fetch_ohlcv(TIMEFRAME_MID)
@@ -134,9 +131,10 @@ def main():
     
     readme_content = f"""# SOL 永续合约量化分析报告
 
-**最后更新**：{current_time}  
+**最后更新**：{beijing_time}（北京时间）
+
 **数据来源**：OKX K线 + Coinglass 衍生数据  
-**指标**：MA(10,50,100,200)、ATR(12)、SuperTrend(10,2.0)
+**技术指标**：MA(10,50,100,200)、ATR(12)、SuperTrend(10,2.0)
 
 ---
 
@@ -162,22 +160,20 @@ def main():
 
 ### 二、交易逻辑与策略分析
 
-**市场结构判断**：当前以 SuperTrend(10,2.0) 为主趋势判断，结合 MA 趋势过滤。
-
 **短期逻辑**：
 - SuperTrend 方向：{"多头" if short_signal['direction']=='做多' else '空头' if short_signal['direction']=='做空' else '中性'}
-- MA排列：MA50 > MA200 = {"多头趋势" if df_short['MA_50'].iloc[-1] > df_short['MA_200'].iloc[-1] else "空头趋势"}
-- ATR(12) = {short_signal['atr']}，止损距离约 2.2 倍 ATR
-- 资金费率：{deriv['funding_rate']}% （{ "正费率偏多" if deriv['funding_rate']>0 else "负费率偏空"}）
+- MA趋势：MA50 > MA200 = {"多头排列" if df_short['MA_50'].iloc[-1] > df_short['MA_200'].iloc[-1] else "空头排列"}
+- 当前ATR(12) = {short_signal['atr']}，止损距离约 2.2×ATR
+- 资金费率：{deriv['funding_rate']}%（{"正费率" if deriv['funding_rate'] > 0 else "负费率"}）
 
-**中期逻辑**：同上，但基于 1 小时图判断，更注重趋势持续性。
+**中期逻辑**：基于1小时图判断，侧重趋势持续性，与短期逻辑一致但更注重大结构。
 
-**核心策略**：仅在 SuperTrend 与 MA 共振时开仓，否则观望。止盈止损严格按 ATR 比例设置，风险收益比约 1:3。
+**核心策略**：仅当 SuperTrend 与 MA50/200 趋势共振时开仓，否则保持观望。止盈止损严格按ATR比例执行。
 
-**风险提示**：本系统为规则驱动量化程序，仅供学习参考。交易有风险，实际使用请严格风控。
+**风险提示**：本报告由固定量化规则自动生成，仅供学习和研究参考，不构成任何投资建议。交易有风险，请严格控制仓位。
 
 ---
-*由 GitHub Actions 每 30 分钟自动运行并更新此 README*
+*由 GitHub Actions 每 30 分钟自动运行并更新*
 """
 
     with open("README.md", "w", encoding="utf-8") as f:
