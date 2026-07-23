@@ -1,8 +1,8 @@
-name: SOL 量化分析
+name: SOL 均值回归挂单分析
 
 on:
   schedule:
-    - cron: '*/30 * * * *'     # 每30分钟一次，推荐先用这个
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -14,15 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: 设置 Python 3.11
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
       - name: 安装依赖
-        run: pip install -r requirements.txt
+        run: pip install ccxt pandas numpy
       
-      - name: 运行分析程序
+      - name: 运行分析
         run: python sol_analyzer.py
       
       - name: 提交更新
@@ -30,5 +30,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add README.md
-          git commit -m "🔄 自动更新 SOL 分析报告 $(date '+ %Y-%m-%d %H:%M:%S')" || echo "No changes to commit"
+          git commit -m "🔄 更新 SOL 挂单分析报告 $(date '+%Y-%m-%d %H:%M:%S')" || echo "No changes"
           git push
